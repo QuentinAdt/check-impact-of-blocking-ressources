@@ -1,48 +1,80 @@
-# 🔍 Visual Resource Blocker Tester with Playwright & Flask
+# Resource Blocking Impact Analysis Tool for Technical SEO
 
-This Python tool allows **technical SEOs** to visually test how third-party resources affect the rendering of a web page. It uses **Playwright** to simulate Googlebot User-Agent and takes screenshots under different blocking scenarios (script, CDN, ad tags, etc.), allowing you to **identify rendering dependencies and third-party performance impacts**.
+## Overview
 
-/!\ It currently doesn't respect the robots.txt /!\
----
+This tool is designed to help technical SEO and QA teams assess the impact of blocking certain web resources on the rendering of a web page, as perceived by a simulated Googlebot Mobile user agent. It captures screenshots of the page under different blocking scenarios. It is particularly useful in pre-production environments before site changes or migrations to identify potential SEO regressions caused by blocked resources (e.g., via `robots.txt`).
 
-## 🚀 What Does It Do?
+By simulating how Googlebot might render a page with certain resources blocked, this tool allows you to:
 
-1. **Loads a page as Googlebot**.
-2. **Blocks predefined or discovered resources** (scripts, CDNs, analytics, ads...).
-3. **Takes full-page screenshots** of:
-   - The reference version (no block).
-   - Each version with one blocked resource.
-   - A version with **all** listed resources blocked.
-4. **(Optional)** Discovers all loaded resource URLs dynamically.
-5. **Serves results in a local Flask dashboard** for easy comparison.
+* **Identify rendering dependencies:** Visually determine if blocking specific resources significantly alters the visible content or page structure.
+* **Validate `robots.txt` impact:** See the rendering effect of blocking resources disallowed by `robots.txt` (the tool checks `robots.txt` rules for Googlebot against blocked resource paths).
+* **Detect rendering regressions:** Compare page rendering with and without blocking specific resources to spot unexpected visual changes.
+* **Facilitate SEO QA:** Provide visual evidence (screenshots) of the page's state under different blocking scenarios.
 
----
+## Key Features
 
-## 🛠 Technologies Used
+* **Benchmark testing:** Takes a reference screenshot of the page with no resources blocked.
+* **Individual resource blocking:** Ability to block specific resource URLs based on a predefined list (substring match) or discovered resources (exact full URL match).
+* **Group resource blocking:** Simultaneously block all resources identified in "Discovery Mode" or all URLs matching the patterns in the "Predefined List".
+* **Auto-discovery mode:** Loads the page initially to identify resources based on specific URL patterns (targeting video/API/media-like URLs, specific paths like `/v1/`, etc.). It captures the *full URL* (including query parameters) of these discovered resources for subsequent individual blocking tests. *Note: This mode can be slower and generate many tests.*
+* **Predefined list mode:** Use a custom list of URL strings. The tool will block any resource whose URL *contains* any of the strings provided in the list.
+* **Robots.txt check:** For each individually blocked resource, the tool checks if its *path* is allowed or disallowed for the "Googlebot" user agent according to the site's `robots.txt` file.
+* **Simple web interface:** Run tests and view results (screenshots, logs, status) via a Flask web application.
+* **Comparative screenshots:** Provides side-by-side visual comparison of rendering with and without blocked resources.
+* **Live logs:** Track test progress and potential errors in real-time within the web interface.
+* **Concurrency:** Runs individual blocking tests in parallel batches to speed up execution.
 
-- `Playwright` (async, headless Chromium)
-- `Flask` (for result visualization)
-- `asyncio` + `argparse`
-- HTML snapshot visualization
-- Blocking logic inspired by user-agent `"Googlebot"`
+## Usage
 
----
+1.  **Installation:** Ensure Python 3 is installed. Clone the repository or save the script code (e.g., as `resource_blocker.py`).
+2.  **Dependencies:** Install the necessary Python libraries:
+    ```bash
+    pip install playwright flask lib-robots-txt-parser
+    ```
+    Install the necessary Playwright browser binaries (only Chromium is used by the script):
+    ```bash
+    playwright install chromium
+    ```
+3.  **Launch:** Run the Python script, specifying a port:
+    ```bash
+    python resource_blocker.py --port 5001
+    ```
+    To launch directly in discovery mode for a specific URL:
+    ```bash
+    python resource_blocker.py --port 5001 --discover --url [https://your-target-site.com](https://your-target-site.com)
+    ```
+    *(Replace `resource_blocker.py` with your actual script filename)*
+4.  **Access the web interface:** Open your browser and navigate to `http://localhost:<port>` or `http://<your-ip>:<port>` (e.g., `http://localhost:5001`).
+5.  **Test Configuration:**
+    * Enter the full URL of the page to test (including `http://` or `https://`).
+    * Choose the blocking mode:
+        * **Use Predefined List:** Enter URL strings (one per line) in the text area. Any resource URL *containing* one of these strings will be blocked in the corresponding tests.
+        * **Discover All Resources (Slow):** The tool will first load the page to find resources matching specific patterns (video/API-like). It will then run tests blocking each discovered *full URL* individually, plus a test blocking all discovered resources.
+    * Click "Start Tests".
+6.  **Viewing Results:** The web interface will update with live logs. Once completed, it displays the reference screenshot and screenshots for each blocking scenario. It indicates the blocked resource (or "all"), the `robots.txt` status for Googlebot (for individual blocks), and any errors encountered.
 
-## 📸 Use Cases for SEOs
+## Technical SEO Use Case
 
-- Measure **visual impact** of third-party JS and CDNs.
-- Understand what breaks when a **resource is blocked**.
-- Emulate **search engine rendering** under failure conditions.
-- Evaluate **critical rendering path** and dependency chains.
-- Audit performance bottlenecks (e.g. if Googlebot renders a broken page due to external services).
+* **Pre-migration/Pre-launch QA:** Test pre-production URLs to ensure critical rendering resources won't be blocked inadvertently post-launch.
+* **`robots.txt` Rule Validation:** Visually confirm the rendering impact of resources disallowed by `robots.txt` rules.
+* **Debugging Rendering Issues:** Help identify if resource blocking (intended or accidental) is causing rendering problems observed by search engines.
+* **Impact Analysis:** Understand how blocking non-essential third-party scripts or assets might affect the core rendering.
+* **Regression Testing:** Periodically run tests after site updates to ensure changes haven't negatively impacted resource availability for rendering.
 
----
+## Test Output
 
-## ⚙️ Configuration
+Results are displayed in the web interface:
 
-Edit directly in the script or via `argparse`:
+* A reference screenshot (no blocking).
+* Screenshots for each individual resource blocked (if applicable).
+* A screenshot for the "block all" scenario (blocking all predefined or discovered resources).
+* For each test:
+    * The resource URL or identifier blocked (e.g., "reference", "all", specific URL).
+    * `robots.txt` status for Googlebot (Allowed/Blocked) for individually blocked resources.
+    * Error messages if a test failed.
 
-```python
-PAGE_URL = "https://www.m6.fr/..."
-PREDEFINED_BLOCK_LIST = [ ... ]  # List of resources to block
-WAIT_AFTER_LOAD = 3500  # Optional wait time after page load (ms)
+Screenshots are saved locally in the `` `screenshots_playwright` `` directory, named according to the test number and blocked resource.
+
+## Contribution
+
+Contributions are welcome! Feel free to submit pull requests to improve the tool.
