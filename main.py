@@ -10,9 +10,10 @@ from flask import Flask, render_template_string, url_for, send_from_directory, a
 import logging
 import threading
 import time
-import lib_robots_txt_parser as robots_parser
+from gpyrobotstxt.robots_cc import RobotsMatcher
 from collections import defaultdict
 from playwright.sync_api import sync_playwright
+import requests
 
 # --- Configuration ---
 # DISCOVER_MODE will be set by argparse
@@ -111,20 +112,17 @@ async def handle_response_for_discovery(response):
         if page_url_base_path and url_base.rstrip('/') == page_url_base_path.rstrip('/'):
             return
 
-        # Détecter les ressources vidéo et API basé sur l'URL de base
-        is_video_or_api = any(pattern in url_base.lower() for pattern in [
-            'video', 'media', 'player', 'stream', 'api', 'layout.6cloud.fr',
-            'token', 'clip', '/v1/', '/v2/', '/v3/'
-        ])
+        # Vérifier si l'URL complète contient des paramètres de requête
+        has_query_params = '?' in full_url
 
-        # If it's a video/API resource and we haven't seen this *full* URL yet, add the full URL
-        if is_video_or_api:
+        # If it's a resource with query parameters and we haven't seen this *full* URL yet, add the full URL
+        if has_query_params:
              if full_url not in discovered_resource_paths:
                  content_type = await response.header_value("content-type") or "N/A"
-                 log_message(f"  [Discovery] Ressource média/API trouvée (avec params): {full_url} (Type: {content_type.split(';')[0]})")
+                 log_message(f"  [Discovery] Ressource avec paramètres trouvée: {full_url} (Type: {content_type.split(';')[0]})")
                  discovered_resource_paths.add(full_url) # Ajoute l'URL complète
 
-        # Note: Non-video/API resources are now ignored in discovery mode
+        # Note: Resources without query parameters are now ignored in discovery mode
 
     except Exception as e:
         log_message(f"  Warning: Could not parse response for {full_url}: {e}")
@@ -146,10 +144,11 @@ async def block_request_handler(route, request, blocked_reason="resource"):
             log_message(f"  Warning: Error during abort (might be normal): {e}")
 
 class RobotsChecker:
-    """Classe pour gérer la vérification des robots.txt avec cache."""
+    """Classe pour gérer la vérification des robots.txt avec le parser officiel de Google."""
     
     def __init__(self):
-        self.parsers = {}  # Cache des parsers de robots.txt par domaine
+        self.matcher = RobotsMatcher()
+        self.robots_cache = {}  # Cache des contenus robots.txt par domaine
         self.results = defaultdict(dict)  # Résultats des vérifications par domaine et chemin
         
     def check_url_allowed(self, url, user_agent="Googlebot"):
@@ -165,32 +164,39 @@ class RobotsChecker:
             scheme = parsed_url.scheme or "https"
             robots_txt_url = f"{scheme}://{domain}/robots.txt"
             
-            # Vérifier si nous avons déjà un parser pour ce domaine
-            if domain not in self.parsers:
-                parser = robots_parser.RobotExclusionRulesParser()
+            # Vérifier si nous avons déjà le contenu du robots.txt en cache
+            if domain not in self.robots_cache:
                 try:
-                    parser.fetch(robots_txt_url)
-                    self.parsers[domain] = parser
-                    log_message(f"  Robots.txt chargé pour {domain}")
+                    response = requests.get(robots_txt_url, timeout=10)
+                    if response.status_code == 200:
+                        self.robots_cache[domain] = response.content
+                    else:
+                        log_message(f"  Pas de robots.txt trouvé pour {domain} (status: {response.status_code})")
+                        self.robots_cache[domain] = b""  # Cache vide si pas de robots.txt
                 except Exception as e:
                     log_message(f"  Erreur lors du chargement du robots.txt pour {domain}: {e}")
-                    return True
-
-            # Obtenir le chemin de la ressource
-            path = parsed_url.path or "/"
+                    self.robots_cache[domain] = b""  # Cache vide en cas d'erreur
+            
+            # Obtenir le chemin complet avec query string
+            path_with_query = parsed_url.path
+            if parsed_url.query:
+                path_with_query += "?" + parsed_url.query
             
             # Vérifier si nous avons déjà le résultat en cache
-            if path in self.results[domain]:
-                return self.results[domain][path]
+            if path_with_query in self.results[domain]:
+                return self.results[domain][path_with_query]
             
-            # Vérifier l'autorisation
-            parser = self.parsers[domain]
-            is_allowed = parser.is_allowed(user_agent, path)
+            # Vérifier l'autorisation avec le parser Google
+            is_allowed = self.matcher.allowed_by_robots(
+                self.robots_cache[domain],
+                [user_agent],
+                url  # gpyrobotstxt requiert l'URL complète
+            )
             
             # Mettre en cache le résultat
-            self.results[domain][path] = is_allowed
+            self.results[domain][path_with_query] = is_allowed
             
-            log_message(f"  Vérification {robots_txt_url} pour {path}: {'autorisé' if is_allowed else 'non autorisé'}")
+            log_message(f"  Vérification {robots_txt_url} pour {path_with_query}: {'autorisé' if is_allowed else 'non autorisé'}")
             return is_allowed
             
         except Exception as e:
@@ -623,9 +629,9 @@ FLASK_TEMPLATE = """
                         <input type="radio" name="mode" value="predefined" {{ 'checked' if not discover_mode else '' }} onclick="toggleUrlList(this)"> Use Predefined List
                     </label>
                     <label>
-                        <input type="radio" name="mode" value="discover" {{ 'checked' if discover_mode else '' }} onclick="toggleUrlList(this)"> Discover All Resources (Slow)
+                        <input type="radio" name="mode" value="discover" {{ 'checked' if discover_mode else 'checked' }} onclick="toggleUrlList(this)"> Discover All Resources (Slow)
                     </label>
-                    <div id="urlListContainer" style="margin-top: 15px; {{ 'display: none;' if discover_mode else '' }}">
+                    <div id="urlListContainer" style="margin-top: 15px; {{ 'display: none;' if discover_mode else 'display: none;' }}">
                         <label for="url_list">URLs à bloquer (une par ligne) :</label>
                         <textarea id="url_list" name="url_list" rows="5" style="width: 100%; margin-top: 8px; padding: 8px; border: 1px solid #ced4da; border-radius: 4px;" placeholder="https://example.com/script.js&#10;https://example.com/style.css">{{ '\n'.join(predefined_urls) if predefined_urls else '' }}</textarea>
                     </div>
@@ -850,6 +856,10 @@ def start_tests():
     if not url:
         return "URL is required.", 400
 
+    # Vérification si mode prédéfini et liste vide
+    if mode == 'predefined' and not url_list:
+        return "En mode 'Predefined List', vous devez fournir au moins une URL à bloquer. Veuillez remplir la liste des URLs avant de lancer les tests.", 400
+
     # Update global config
     PAGE_URL = url
     DISCOVER_MODE = (mode == 'discover')
@@ -952,5 +962,7 @@ if __name__ == "__main__":
         print("Error: --url is required when --discover is enabled")
         sys.exit(1)
 
-    flask_app.run(host='0.0.0.0', port=args.port)
+    # Activation du mode debug pour le rechargement automatique
+    flask_app.debug = True
+    flask_app.run(host='0.0.0.0', port=args.port, debug=True)
 
