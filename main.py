@@ -5,23 +5,20 @@ import re
 import sys
 import argparse # Added import for arguments
 from playwright.async_api import async_playwright, Error as PlaywrightError
-from urllib.parse import urlparse
-from flask import Flask, render_template_string, url_for, send_from_directory, abort, request, redirect
+from urllib.parse import urlparse, urlunparse, quote as url_quote
+from flask import Flask, render_template_string, url_for, send_from_directory, abort, request, redirect, jsonify
 import logging
 import threading
 import time
+import lib_robots_txt_parser as robots_parser
+from collections import defaultdict
+from playwright.sync_api import sync_playwright
 
 # --- Configuration ---
 # DISCOVER_MODE will be set by argparse
 # PAGE_URL will be set by argparse
 
-PREDEFINED_BLOCK_LIST = [
-    "cdns.eu1.gigya.com/js/gigya.js",
-    "js-agent.newrelic.com/nr-spa",
-    "sdk.privacy-center.org/",
-    "securepubads.g.doubleclick.net/pagead/managed/js/gpt/",
-    "googletagservices.com/tag/js/gpt.js",
-]
+PREDEFINED_BLOCK_LIST = []
 
 OUTPUT_DIR = "screenshots_playwright"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -34,6 +31,7 @@ DISCOVER_MODE = False # Will be set by argparse
 PAGE_URL = None # Will be set by argparse or the form
 test_status = "idle" # idle, running, completed, error
 test_log = [] # To store logs for live updates
+predefined_urls = [] # To store the list of URLs to block
 
 # --- Utility Functions ---
 def sanitize_filename(url_part):
@@ -94,42 +92,113 @@ page_url_parsed = None # Will be set when PAGE_URL is known
 page_url_base_path = None # Will be set when PAGE_URL is known
 
 async def handle_response_for_discovery(response):
-    """Callback to discover resource URLs during the initial page load."""
+    """Callback to discover resource URLs during the initial page load.
+       Only adds full URLs (with query) for resources matching video/API patterns.
+    """
     global discovered_resource_paths, page_url_base_path
-    url = response.url
+    full_url = response.url # Utiliser l'URL complète dès le début
     try:
-        parsed_url = urlparse(url)
+        parsed_url = urlparse(full_url)
 
         # Ignore non-http/https schemes
         if parsed_url.scheme not in ['http', 'https']:
             return
 
-        # Get the base URL (scheme://netloc/path)
+        # Get the base URL (scheme://netloc/path) for pattern matching only
         url_base = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
-        # Ignore the main page URL itself
+        # Ignore the main page URL itself (comparison based on base path)
         if page_url_base_path and url_base.rstrip('/') == page_url_base_path.rstrip('/'):
             return
 
-        # If this base URL hasn't been seen, add it
-        if url_base not in discovered_resource_paths:
-            content_type = response.header_value("content-type") or "N/A"
-            # log_message(f"  [Discovery] Resource: {url_base} (Type: {content_type.split(';')[0]})") # Optional: uncomment to see all discoveries
-            discovered_resource_paths.add(url_base)
+        # Détecter les ressources vidéo et API basé sur l'URL de base
+        is_video_or_api = any(pattern in url_base.lower() for pattern in [
+            'video', 'media', 'player', 'stream', 'api', 'layout.6cloud.fr',
+            'token', 'clip', '/v1/', '/v2/', '/v3/'
+        ])
+
+        # If it's a video/API resource and we haven't seen this *full* URL yet, add the full URL
+        if is_video_or_api:
+             if full_url not in discovered_resource_paths:
+                 content_type = await response.header_value("content-type") or "N/A"
+                 log_message(f"  [Discovery] Ressource média/API trouvée (avec params): {full_url} (Type: {content_type.split(';')[0]})")
+                 discovered_resource_paths.add(full_url) # Ajoute l'URL complète
+
+        # Note: Non-video/API resources are now ignored in discovery mode
 
     except Exception as e:
-        log_message(f"  Warning: Could not parse response for {url}: {e}")
+        log_message(f"  Warning: Could not parse response for {full_url}: {e}")
 
 
 async def block_request_handler(route, request, blocked_reason="resource"):
     """Callback to block a request."""
-    # log_message(f"  >> Blocking ({blocked_reason[:20]}...): {request.url[:80]}...") # Optional: uncomment to see every block
+    # Log the exact URL, type, and frame URL being blocked
+    resource_type = request.resource_type
+    frame_url = request.frame.url
+    log_message(f"  >> Blocking Request (Reason: {blocked_reason}, Type: {resource_type}, Frame: {frame_url}): {request.url}")
+    # Optional log (kept commented)
+    # log_message(f"  >> Blocking ({blocked_reason[:20]}...): {request.url[:80]}...")
     try:
         await route.abort()
     except PlaywrightError as e:
         # Ignore errors caused by the page/context closing during abort
         if "Target page, context or browser has been closed" not in str(e) and "Request context is destroyed" not in str(e):
             log_message(f"  Warning: Error during abort (might be normal): {e}")
+
+class RobotsChecker:
+    """Classe pour gérer la vérification des robots.txt avec cache."""
+    
+    def __init__(self):
+        self.parsers = {}  # Cache des parsers de robots.txt par domaine
+        self.results = defaultdict(dict)  # Résultats des vérifications par domaine et chemin
+        
+    def check_url_allowed(self, url, user_agent="Googlebot"):
+        """Vérifie si une URL est autorisée pour un user-agent donné."""
+        try:
+            parsed_url = urlparse(url)
+            if not parsed_url.netloc:
+                log_message(f"  Erreur: URL invalide sans domaine: {url}")
+                return True
+
+            # Construire l'URL du robots.txt pour ce domaine
+            domain = parsed_url.netloc
+            scheme = parsed_url.scheme or "https"
+            robots_txt_url = f"{scheme}://{domain}/robots.txt"
+            
+            # Vérifier si nous avons déjà un parser pour ce domaine
+            if domain not in self.parsers:
+                parser = robots_parser.RobotExclusionRulesParser()
+                try:
+                    parser.fetch(robots_txt_url)
+                    self.parsers[domain] = parser
+                    log_message(f"  Robots.txt chargé pour {domain}")
+                except Exception as e:
+                    log_message(f"  Erreur lors du chargement du robots.txt pour {domain}: {e}")
+                    return True
+
+            # Obtenir le chemin de la ressource
+            path = parsed_url.path or "/"
+            
+            # Vérifier si nous avons déjà le résultat en cache
+            if path in self.results[domain]:
+                return self.results[domain][path]
+            
+            # Vérifier l'autorisation
+            parser = self.parsers[domain]
+            is_allowed = parser.is_allowed(user_agent, path)
+            
+            # Mettre en cache le résultat
+            self.results[domain][path] = is_allowed
+            
+            log_message(f"  Vérification {robots_txt_url} pour {path}: {'autorisé' if is_allowed else 'non autorisé'}")
+            return is_allowed
+            
+        except Exception as e:
+            log_message(f"  Erreur lors de la vérification robots.txt pour {url}: {e}")
+            return True
+
+# Créer une instance globale du RobotsChecker
+robots_checker = RobotsChecker()
 
 async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_combined_block=False, block_list_for_all=None):
     """Runs a single Playwright test case (reference or blocking one/all resources)."""
@@ -140,15 +209,18 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
     current_blocked_item = "None (Reference)"
     if is_combined_block:
         name_for_file = "all"
-        current_blocked_item = "BLOCK_ALL" # Changed from TOUT
+        current_blocked_item = "BLOCK_ALL"
     elif url_to_block:
         current_blocked_item = url_to_block
+        # Vérifier si la ressource est autorisée pour Googlebot
+        is_allowed = robots_checker.check_url_allowed(url_to_block)
+        log_message(f"  Ressource {url_to_block} {'autorisée' if is_allowed else 'non autorisée'} pour Googlebot")
 
     # Generate filenames
     filename_base = sanitize_filename(name_for_file)
     screenshot_filename = f"{file_prefix}_{filename_base}{reason_suffix}.png"
     screenshot_path = os.path.join(OUTPUT_DIR, screenshot_filename)
-    error_screenshot_filename = f"{file_prefix}_{filename_base}{reason_suffix}_ERROR.png" # Changed from _ERREUR
+    error_screenshot_filename = f"{file_prefix}_{filename_base}{reason_suffix}_ERROR.png"
     error_screenshot_path = os.path.join(OUTPUT_DIR, error_screenshot_filename)
 
     log_message(f"\n--- Test {file_prefix}: Blocking '{current_blocked_item}' ---")
@@ -161,7 +233,8 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
         'error_message': None,
         'prefix': file_prefix,
         'suffix': reason_suffix,
-        'blocked_item': current_blocked_item
+        'blocked_item': current_blocked_item,
+        'googlebot_allowed': True if is_reference else (robots_checker.check_url_allowed(url_to_block) if url_to_block else None)
     }
 
     context = None
@@ -182,9 +255,17 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
                 else:
                     # Define the blocking condition based on DISCOVER_MODE
                     if DISCOVER_MODE:
-                        # Exact path match (startswith)
+                        # Exact path match (startswith) and pattern matching
                         def should_block_all(url_str):
-                            return any(url_str.startswith(path) for path in list_to_use)
+                            # Vérifier les correspondances exactes
+                            if any(url_str.startswith(path) for path in list_to_use):
+                                return True
+                            # Vérifier les patterns pour les ressources vidéo/API
+                            parsed_url = urlparse(url_str)
+                            url_base = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+                            video_patterns = ['video', 'media', 'player', 'stream', 'api', 'layout.6cloud.fr',
+                                           'token', 'clip', '/v1/', '/v2/', '/v3/']
+                            return any(pattern in url_base.lower() for pattern in video_patterns)
                     else:
                         # Substring match (contains)
                         def should_block_all(url_str):
@@ -193,14 +274,17 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
                     # Route matching requests to the block handler
                     await context.route(
                         should_block_all,
-                        lambda route, request: asyncio.ensure_future(block_request_handler(route, request, "BLOCK_ALL")) # Changed from TOUT
+                        lambda route, request: asyncio.ensure_future(block_request_handler(route, request, "BLOCK_ALL"))
                     )
                     log_message(f"  Blocking rule enabled for ALL {len(list_to_use)} resources.")
             else:
                 # Block a single URL pattern
                 if DISCOVER_MODE:
-                    # Exact path match (startswith)
-                    block_condition = lambda url_str: url_str.startswith(url_to_block)
+                    # Compare base paths, ignoring query parameters
+                    def block_condition(url_str):
+                         # Direct comparison since url_to_block now includes query params
+                         return url_str == url_to_block
+                    # ====> FIN DU REMPLACEMENT <====
                 else:
                     # Substring match (contains)
                     block_condition = lambda url_str: url_to_block in url_str
@@ -208,7 +292,7 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
                 # Route matching requests to the block handler
                 await context.route(
                     block_condition,
-                    lambda route, request, ub=url_to_block: asyncio.ensure_future(block_request_handler(route, request, ub[:30])) # Pass blocked url for logging context
+                    lambda route, request, ub=url_to_block: asyncio.ensure_future(block_request_handler(route, request, ub[:30]))
                 )
                 log_message(f"  Blocking rule enabled for: {url_to_block}")
 
@@ -219,10 +303,13 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
             # Navigate to the target page
             log_message(f"  Navigating to {PAGE_URL}...")
             # Wait until the network is idle (or timeout)
-            await page.goto(PAGE_URL, wait_until="networkidle", timeout=60000)
-            log_message(f"  Page loaded ('networkidle'). Taking screenshot...")
-            # Take a full-page screenshot
-            await page.screenshot(path=screenshot_path, full_page=True)
+            await page.goto(PAGE_URL, wait_until="networkidle", timeout=90000) # Augmentation du timeout de goto à 90s
+            log_message(f"  Page loaded ('networkidle'). Waiting briefly before screenshot...") # Log avant attente
+            # >> Délai réduit <<
+            await page.wait_for_timeout(2000) # Attendre 2 secondes (réduction)
+            log_message(f"  Taking screenshot...")
+            # Take a full-page screenshot with increased timeout
+            await page.screenshot(path=screenshot_path, full_page=True, timeout=90000)
             log_message(f"  Screenshot saved: {screenshot_path}")
 
         except Exception as e_nav:
@@ -232,9 +319,9 @@ async def run_single_test(browser, url_to_block, file_prefix, reason_suffix, is_
             result_data['error_message'] = str(e_nav)
             result_data['screenshot_file'] = error_screenshot_filename # Use error filename
             try:
-                # Try taking an error screenshot anyway
+                # Try taking an error screenshot anyway, also with timeout
                 if page and not page.is_closed():
-                    await page.screenshot(path=error_screenshot_path, full_page=True)
+                    await page.screenshot(path=error_screenshot_path, full_page=True, timeout=90000)
                     log_message(f"  Error screenshot saved: {error_screenshot_path}")
             except Exception as e_shot:
                 log_message(f"  Could not take screenshot even after error: {e_shot}")
@@ -297,6 +384,7 @@ async def run_playwright_test_suite():
             urls_to_test = []
             list_for_all_block = []
             reason = "" # Suffix for filenames based on mode
+            CONCURRENCY = 5 # Nombre de tests à exécuter en parallèle
 
             # --- Determine URLs to block ---
             if DISCOVER_MODE:
@@ -342,13 +430,23 @@ async def run_playwright_test_suite():
                 list_for_all_block = PREDEFINED_BLOCK_LIST
                 reason = "_predefined" # Changed from _predefini
 
-            # --- Run 2: Individual Blocking Tests ---
+            # --- Run 2: Individual Blocking Tests (in parallel) ---
             if not urls_to_test:
                 log_message("\nWARNING: No URLs found or defined to test for blocking.")
             else:
-                log_message(f"\n--- Starting {len(urls_to_test)} individual blocking tests ---")
+                log_message(f"\n--- Starting {len(urls_to_test)} individual blocking tests (Concurrency: {CONCURRENCY}) ---")
+                tasks = []
                 for i, url_to_block in enumerate(urls_to_test):
-                    await run_single_test(browser, url_to_block, f"{i+1:02d}", reason)
+                    # Crée une tâche pour chaque test individuel sans l'attendre immédiatement
+                    task = asyncio.create_task(run_single_test(browser, url_to_block, f"{i+1:02d}", reason))
+                    tasks.append(task)
+
+                # Exécuter les tâches par lots
+                for i in range(0, len(tasks), CONCURRENCY):
+                    batch = tasks[i:i + CONCURRENCY]
+                    log_message(f"  Running batch {i // CONCURRENCY + 1} ({len(batch)} tests)...")
+                    await asyncio.gather(*batch) # Attend la fin du lot actuel avant de passer au suivant
+                    log_message(f"  Batch {i // CONCURRENCY + 1} finished.")
 
                 # --- Run 3: Block All Test ---
                 await run_single_test(browser, "BLOCK_ALL", "99", "_all", is_combined_block=True, block_list_for_all=list_for_all_block) # Changed from TOUT_BLOQUER, _tout
@@ -432,6 +530,84 @@ FLASK_TEMPLATE = """
         .fullscreen-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); justify-content: center; align-items: center; z-index: 1000; cursor: zoom-out; padding: 10px; box-sizing: border-box;}
         .fullscreen-image { max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 0 30px rgba(0,0,0,0.5); }
         .mode-info { text-align: center; margin-bottom: 20px; font-size: 0.95em; color: #6c757d; padding: 10px; background-color: #e9ecef; border-radius: 4px;}
+
+        /* Googlebot Status Styling */
+        .googlebot-status {
+            margin: 8px 0;
+            padding: 8px 12px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.95em;
+            font-weight: 500;
+        }
+        .googlebot-status::before {
+            content: '';
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            background-size: contain;
+            background-repeat: no-repeat;
+            background-position: center;
+        }
+        .googlebot-status.allowed {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .googlebot-status.allowed::before {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23155724'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E");
+        }
+        .googlebot-status.blocked {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .googlebot-status.blocked::before {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23721c24'%3E%3Cpath d='M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z'/%3E%3C/svg%3E");
+        }
+        .test-case {
+            position: relative;
+        }
+        .googlebot-badge {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        .googlebot-badge.allowed {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .googlebot-badge.blocked {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        .blocked-resources-summary {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+            border: 1px solid #ffeeba;
+        }
+        
+        .no-blocked-resources {
+            background-color: #d4edda;
+            color: #155724;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+            font-size: 1.2em;
+            border: 1px solid #c3e6cb;
+        }
     </style>
 </head>
 <body>
@@ -444,11 +620,15 @@ FLASK_TEMPLATE = """
                 <input type="url" id="page_url" name="page_url" placeholder="https://example.com" required value="{{ current_url if current_url else '' }}">
                 <div class="form-options">
                     <label>
-                        <input type="radio" name="mode" value="predefined" {{ 'checked' if not discover_mode else '' }}> Use Predefined List
+                        <input type="radio" name="mode" value="predefined" {{ 'checked' if not discover_mode else '' }} onclick="toggleUrlList(this)"> Use Predefined List
                     </label>
                     <label>
-                        <input type="radio" name="mode" value="discover" {{ 'checked' if discover_mode else '' }}> Discover All Resources (Slow)
+                        <input type="radio" name="mode" value="discover" {{ 'checked' if discover_mode else '' }} onclick="toggleUrlList(this)"> Discover All Resources (Slow)
                     </label>
+                    <div id="urlListContainer" style="margin-top: 15px; {{ 'display: none;' if discover_mode else '' }}">
+                        <label for="url_list">URLs à bloquer (une par ligne) :</label>
+                        <textarea id="url_list" name="url_list" rows="5" style="width: 100%; margin-top: 8px; padding: 8px; border: 1px solid #ced4da; border-radius: 4px;" placeholder="https://example.com/script.js&#10;https://example.com/style.css">{{ '\n'.join(predefined_urls) if predefined_urls else '' }}</textarea>
+                    </div>
                 </div>
                 <input type="submit" value="Start Tests" {{ 'disabled' if test_status == 'running' else '' }}>
             </form>
@@ -482,31 +662,50 @@ FLASK_TEMPLATE = """
         {% endif %}
 
         {% if results %}
-        <h2>Test Results</h2>
-        <div class="test-grid">
-            {% for result in results %}
-            <div class="test-case {% if result.error %}error{% endif %}">
-                <h3>Test {{ result.prefix }}: {{ result.name | e }}{{ result.suffix | e }}</h3>
-                <p><strong>Blocked Item:</strong> <span class="blocked-item" title="{{ result.blocked_item | e if result.blocked_item else 'None (Reference)' }}">{{ result.blocked_item | e if result.blocked_item else 'None (Reference)' }}</span></p>
-                {% if result.error %}
-                    <div class="error-message"><strong>Error:</strong> {{ result.error_message | e }}</div>
-                {% endif %}
-                <div class="screenshot-container">
-                    <img src="{{ url_for('serve_screenshot', filename=result.screenshot_file) }}"
-                         alt="Screenshot for {{ result.name | e }}"
-                         class="screenshot"
-                         loading="lazy"
-                         onclick="showFullscreen('{{ url_for('serve_screenshot', filename=result.screenshot_file) }}')"
-                         onerror="this.alt='Screenshot not found'; this.style.display='none';"> </div>
+        <h2>Résultats des Tests</h2>
+        
+        {# Filtrer les résultats pour ne garder que les ressources bloquées #}
+        {% set blocked_resources = [] %}
+        {% for result in results %}
+            {% if result.googlebot_allowed is defined and result.googlebot_allowed == false %}
+                {% set _ = blocked_resources.append(result) %}
+            {% endif %}
+        {% endfor %}
+
+        {% if blocked_resources|length > 0 %}
+            <div class="blocked-resources-summary">
+                <h3>⚠️ {{ blocked_resources|length }} ressource(s) bloquée(s) pour Googlebot</h3>
             </div>
-            {% else %}
-            <p>No test results found yet.</p>
-            {% endfor %}
-        </div>
-        {% elif test_status == 'completed' %}
-         <p>Tests completed, but no results were generated (check logs).</p>
-        {% elif test_status == 'idle' and not current_url %}
-         <p>Enter a URL above and start the tests to see results.</p>
+            <div class="test-grid">
+                {% for result in blocked_resources %}
+                <div class="test-case {% if result.error %}error{% endif %}">
+                    <div class="googlebot-badge blocked">
+                        🚫 Bloqué
+                    </div>
+                    <h3>Test {{ result.prefix }}: {{ result.name | e }}{{ result.suffix | e }}</h3>
+                    <p><strong>Ressource :</strong> <span class="blocked-item" title="{{ result.blocked_item | e }}">{{ result.blocked_item | e }}</span></p>
+                    <p class="googlebot-status blocked">
+                        <strong>Accès Googlebot :</strong> Cette ressource est BLOQUÉE pour Googlebot
+                    </p>
+                    {% if result.error %}
+                        <div class="error-message"><strong>Error:</strong> {{ result.error_message | e }}</div>
+                    {% endif %}
+                    <div class="screenshot-container">
+                        <img src="{{ url_for('serve_screenshot', filename=result.screenshot_file) }}"
+                             alt="Screenshot for {{ result.name | e }}"
+                             class="screenshot"
+                             loading="lazy"
+                             onclick="showFullscreen('{{ url_for('serve_screenshot', filename=result.screenshot_file) }}')"
+                             onerror="this.alt='Screenshot not found'; this.style.display='none';">
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="no-blocked-resources">
+                ✅ Aucune ressource n'a été bloquée pour les robots de Google.
+            </div>
+        {% endif %}
         {% endif %}
     </div>
 
@@ -614,6 +813,11 @@ FLASK_TEMPLATE = """
              });
          }
 
+        function toggleUrlList(radio) {
+            const container = document.getElementById('urlListContainer');
+            container.style.display = radio.value === 'predefined' ? 'block' : 'none';
+        }
+
     </script>
 </body>
 </html>
@@ -628,18 +832,20 @@ def index():
                                   current_url=PAGE_URL, # Pass the currently tested URL
                                   discover_mode=DISCOVER_MODE,
                                   test_status=test_status,
-                                  log_lines=test_log)
+                                  log_lines=test_log,
+                                  predefined_urls=predefined_urls) # Pass the predefined URLs
 
 @flask_app.route('/start', methods=['POST'])
 def start_tests():
     """Handles the form submission to start a new test run."""
-    global PAGE_URL, DISCOVER_MODE, test_status, test_log, test_results
+    global PAGE_URL, DISCOVER_MODE, test_status, test_log, test_results, PREDEFINED_BLOCK_LIST, predefined_urls
     if test_status == 'running':
         # Prevent starting new tests if already running
         return "Tests are already in progress.", 429 # Too Many Requests
 
     url = request.form.get('page_url')
     mode = request.form.get('mode') # 'discover' or 'predefined'
+    url_list = request.form.get('url_list', '').strip()
 
     if not url:
         return "URL is required.", 400
@@ -647,6 +853,16 @@ def start_tests():
     # Update global config
     PAGE_URL = url
     DISCOVER_MODE = (mode == 'discover')
+    
+    # Update predefined URLs if in predefined mode
+    if not DISCOVER_MODE and url_list:
+        # Split the textarea content into lines and filter out empty lines
+        predefined_urls = [line.strip() for line in url_list.split('\n') if line.strip()]
+        PREDEFINED_BLOCK_LIST = predefined_urls
+    else:
+        predefined_urls = []
+        PREDEFINED_BLOCK_LIST = []
+
     test_status = "starting" # Indicate that tests are about to run
     test_log = ["Test run requested..."]
     test_results = [] # Clear previous results
@@ -692,64 +908,49 @@ def serve_screenshot(filename):
         print(f"File not found: {filename}")
         abort(404)
 
+@flask_app.route('/check_impact', methods=['GET'])
+def check_impact():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "URL parameter is required"}), 400
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        
+        # Mesurer le temps de chargement sans bloquer les ressources
+        page.goto(url)
+        normal_timing = page.evaluate('() => ({loadTime: window.performance.timing.loadEventEnd - window.performance.timing.navigationStart})')
+        
+        # Mesurer le temps de chargement en bloquant les ressources
+        context = browser.new_context()
+        page = context.new_page()
+        page.route("**/*.{png,jpg,jpeg,gif,webp,css,js}", lambda route: route.abort())
+        page.goto(url)
+        blocked_timing = page.evaluate('() => ({loadTime: window.performance.timing.loadEventEnd - window.performance.timing.navigationStart})')
+        
+        browser.close()
+        
+        return jsonify({
+            "normal_load_time": normal_timing["loadTime"],
+            "blocked_load_time": blocked_timing["loadTime"],
+            "difference": normal_timing["loadTime"] - blocked_timing["loadTime"]
+        })
+
 # --- Execution ---
 if __name__ == "__main__":
-    # --- Argument Handling ---
-    parser = argparse.ArgumentParser(description="Test page rendering by blocking resources and display results via Flask.")
-    # Remove the URL argument from here as it's handled by the Flask form
-    # parser.add_argument(
-    #     '--url',
-    #     type=str,
-    #     required=False, # Make it optional if we want a default or rely solely on Flask UI
-    #     help="The URL of the page to test (e.g., https://example.com)."
-    # )
-    parser.add_argument(
-        '--discover-all',
-        action='store_true',
-        default=False, # Default is predefined list
-        help="Enable discovery mode to block all loaded resources one by one (can be very slow). Default uses the predefined list."
-    )
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=5001,
-        help="Port for the Flask server (default: 5001)."
-    )
+    parser = argparse.ArgumentParser(description='Check Impact of Blocking Resources')
+    parser.add_argument('--port', type=int, default=5001, help='Port to run the server on')
+    parser.add_argument('--discover', action='store_true', help='Enable discovery mode')
+    parser.add_argument('--url', type=str, help='URL to test in discovery mode')
     args = parser.parse_args()
 
-    # Set initial mode from args (can be overridden by Flask UI later)
-    # We don't set PAGE_URL here anymore
-    DISCOVER_MODE = args.discover_all
-    FLASK_PORT = args.port
+    DISCOVER_MODE = args.discover
+    PAGE_URL = args.url
 
-    # --- Launch Flask ---
-    # Playwright tests are now triggered via the Flask UI '/start' endpoint
-    print("\n--- Starting the Flask web interface ---")
-    print(f"Open your browser and go to: http://127.0.0.1:{FLASK_PORT}")
-    print("Use the web form to enter the URL and start the tests.")
-    print("Press CTRL+C in this terminal to stop the server.")
+    if DISCOVER_MODE and not PAGE_URL:
+        print("Error: --url is required when --discover is enabled")
+        sys.exit(1)
 
-    try:
-        # Check if waitress is available for a more production-ready server
-        try:
-            from waitress import serve
-            print(f"Using Waitress server on port {FLASK_PORT}.")
-            # Use more threads for potentially better handling of concurrent requests (polling + screenshot serving)
-            serve(flask_app, host='127.0.0.1', port=FLASK_PORT, threads=8)
-        except ImportError:
-            print(f"Waitress not found, using Flask's development server on port {FLASK_PORT} (less stable).")
-            # debug=False and use_reloader=False are important for running async tasks in threads correctly
-            flask_app.run(host='127.0.0.1', port=FLASK_PORT, debug=False, use_reloader=False)
-
-    except OSError as e:
-        if "address already in use" in str(e).lower():
-            print(f"\nERROR: Port {FLASK_PORT} is already in use.")
-            print("Try stopping the application using this port or use a different port via the --port option.")
-            print(f"Example: python {sys.argv[0]} --port 5002")
-        else:
-            print(f"\nError starting Flask: {e}")
-    except Exception as e:
-        print(f"\nError starting Flask: {e}")
-
-    print("\nScript finished.")
+    flask_app.run(host='0.0.0.0', port=args.port)
 
