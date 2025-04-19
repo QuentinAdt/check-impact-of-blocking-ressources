@@ -29,7 +29,7 @@ By simulating how Googlebot might render a page with certain resources blocked, 
 1.  **Installation:** Ensure Python 3 is installed. Clone the repository or save the script code (e.g., as `resource_blocker.py`).
 2.  **Dependencies:** Install the necessary Python libraries:
     ```bash
-    pip install playwright flask lib-robots-txt-parser
+    pip install playwright flask gpyrobotstxt
     ```
     Install the necessary Playwright browser binaries (only Chromium is used by the script):
     ```bash
